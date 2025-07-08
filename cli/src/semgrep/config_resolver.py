@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import os
 import re
@@ -261,7 +262,15 @@ class ConfigLoader:
         self, require_repo_name: bool
     ) -> out.ProjectMetadata:
         repo_name = os.environ.get("SEMGREP_REPO_NAME")
-        repo_display_name = os.environ.get("SEMGREP_REPO_DISPLAY_NAME", repo_name)
+        repo_display_name = os.environ.get("SEMGREP_REPO_DISPLAY_NAME")
+        project_id = os.environ.get("SEMGREP_PROJECT_ID")
+        if repo_display_name:
+            if project_id:
+                raise SemgrepError(
+                    "The environment variables SEMGREP_PROJECT_ID and SEMGREP_REPO_DISPLAY_NAME cannot both be set at the same time."
+                )
+        else:
+            repo_display_name = repo_name
 
         if repo_name is None:
             if require_repo_name:
@@ -272,7 +281,6 @@ class ConfigLoader:
                 repo_name = "unknown"
 
         return out.ProjectMetadata(
-            semgrep_version=out.Version(__VERSION__),
             scan_environment="semgrep-scan",
             repository=repo_name,
             repo_display_name=repo_display_name,
@@ -291,6 +299,7 @@ class ConfigLoader:
             pull_request_id=None,
             pull_request_title=None,
             is_full_scan=True,  # always true for standalone scan
+            project_id=project_id,
         )
 
     def _fetch_semgrep_cloud_platform_scan_config(self) -> ConfigFile:
@@ -310,7 +319,6 @@ class ConfigLoader:
         )
 
         request = out.ScanRequest(
-            meta=out.RawJson({}),  # required for now, but we won't populate it
             scan_metadata=out.ScanMetadata(
                 cli_version=out.Version(__VERSION__),
                 unique_id=out.Uuid(str(state.local_scan_id)),
@@ -360,7 +368,7 @@ class ConfigLoader:
                 )
 
             scan_response = out.ScanResponse.from_json(response.json())
-            # get_state().traces.set_scan_info(scan_response.info)
+            get_state().traces.set_scan_info(scan_response.info)
             return ConfigFile(None, scan_response.config.rules.to_json_string(), url)
 
         except requests.exceptions.RetryError as ex:
@@ -432,18 +440,12 @@ def parse_config_files(
     """
     config = {}
     errors: List[SemgrepError] = []
-    # NOTE: This was pretty slow for directories with many rules. Now for 220+ rules
-    # a moderate repo scan took ~45s instead of ~55s, so a 20% improvement.
-    # XXX: One test fails, because we don't capture the output from the executor
-    # pool. But I manually tested that the expected error was printed, so it's a
-    # test configuration issue.
-    #
-    # for config_id, contents, config_path in loaded_config_infos:
-    from concurrent.futures import ThreadPoolExecutor
-    @tracing.trace()
-    def process_config_item(config_item):
-        config_id, contents, config_path = config_item
-        try:
+    future_to_config_id_and_path: Dict[
+        concurrent.futures.Future[Tuple[Dict[str, YamlTree], List[SemgrepError]]],
+        Tuple[str, str],
+    ] = {}
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        for config_id, contents, config_path in loaded_config_infos:
             if not config_id:  # registry rules don't have config ids
                 # Note: we must disambiguate registry sourced remote rules from
                 # non-registry sourced ones for security purposes. Namely, we
@@ -466,36 +468,33 @@ def parse_config_files(
                 filename = f"{config_path[:20]}..."
             else:
                 filename = config_path
-            config_data, config_errors = parse_config_string(
-                config_id, contents, filename, force_jsonschema=force_jsonschema
+            validation_future = executor.submit(
+                parse_config_string,
+                config_id,
+                contents,
+                filename,
+                force_jsonschema=force_jsonschema,
             )
-            return 'Ok', config_data, config_errors
-
-        except InvalidRuleSchemaError as e:
-            if (
-                config_id == REGISTRY_CONFIG_ID
-                or config_id == NON_REGISTRY_REMOTE_CONFIG_ID
-            ):
-                notice = f"\nRules downloaded from {config_path} failed to parse.\nThis is likely because rules have been added that use functionality introduced in later versions of semgrep.\nPlease upgrade to latest version of semgrep (see https://semgrep.dev/docs/upgrading/) and try again.\n"
-                notice_color = with_color(Colors.red, notice, bold=True)
-                logger.error(notice_color)
-                return 'Error', e
-            else:
-                return 'Error', e
-
-    with ThreadPoolExecutor() as executor:
-        results = list(executor.map(process_config_item, loaded_config_infos))
-
-    # Merge results
-    for res in results:
-        if res[0] == 'Ok':
-            config_data, config_errors = res[1:]
-            config.update(config_data)
-            errors.extend(config_errors)
-        else:
-            # Raise the first error:
-            raise res[1]
-
+            future_to_config_id_and_path[validation_future] = config_id, config_path
+        for future in concurrent.futures.as_completed(
+            future_to_config_id_and_path, timeout=5 * 60
+        ):
+            config_id, config_path = future_to_config_id_and_path[future]
+            try:
+                config_data, config_errors = future.result()
+                config.update(config_data)
+                errors.extend(config_errors)
+            except InvalidRuleSchemaError as e:
+                if (
+                    config_id == REGISTRY_CONFIG_ID
+                    or config_id == NON_REGISTRY_REMOTE_CONFIG_ID
+                ):
+                    notice = f"\nRules downloaded from {config_path} failed to parse.\nThis is likely because rules have been added that use functionality introduced in later versions of semgrep.\nPlease upgrade to latest version of semgrep (see https://semgrep.dev/docs/upgrading/) and try again.\n"
+                    notice_color = with_color(Colors.red, notice, bold=True)
+                    logger.error(notice_color)
+                    raise e
+                else:
+                    raise e
     return config, errors
 
 
@@ -738,8 +737,6 @@ def validate_single_rule(config_id: str, rule_yaml: YamlTree[YamlMap]) -> Rule:
     Validate that a rule dictionary contains all necessary keys
     and can be correctly parsed.
     """
-    rule: YamlMap = rule_yaml.value
-
     # Defaults to search mode if mode is not specified
     return Rule.from_yamltree(rule_yaml)
 
